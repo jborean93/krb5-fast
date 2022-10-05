@@ -46,6 +46,8 @@ kvno host/win.fast.test@FAST.TEST
 It looks like Microsoft AD does not enforce armouring for machine accounts which is why the original `kinit` for the machine account works.
 The code that generates the keytab must be done on a machine account in AD as using a user principal causes the `kinit` stage to fail due to the policy rejecting the un armoured authentication.
 
+## How to Acquire a Credential in Python
+
 To replicate this in the MIT krb5 API you can install [pykrb5](https://github.com/jborean93/pykrb5) and [gssapi](https://github.com/pythongssapi/python-gssapi) which expose a nice managed layer to the krb5/gssapi API with:
 
 ```bash
