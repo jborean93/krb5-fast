@@ -1,0 +1,262 @@
+- name: get network adapter for each Windows host
+  hosts: windows
+  gather_facts: no
+  tasks:
+  - name: get network connection for private adapter
+    win_shell: |
+      foreach ($instance in (Get-CimInstance -ClassName Win32_NetworkAdapter -Filter "Netenabled='True'")) {
+          $instance_config = Get-CimInstance -ClassName WIn32_NetworkAdapterConfiguration -Filter "Index = '$($instance.Index)'"
+          if ($instance_config.IPAddress -contains "{{ansible_host}}") {
+              $instance.NetConnectionID
+          }
+      }
+    changed_when: no
+    register: network_connection_name_raw
+
+  - name: fail if we didn't get a network connection name
+    fail:
+      msg: Failed to get the Windows network connection name
+    when: network_connection_name_raw.stdout_lines | count != 1
+
+  - name: set fact of network connection name
+    set_fact:
+      network_connection_name: '{{ network_connection_name_raw.stdout | trim }}'
+
+  - name: allow SMB traffic in
+    win_firewall_rule:
+      name: File and Printer Sharing (SMB-In)
+      state: present
+      enabled: yes
+
+- name: create Domain Controller
+  hosts: win_controller
+  gather_facts: no
+  tasks:
+  - name: set the DNS for the specified adapter to localhost
+    win_dns_client:
+      adapter_name: '{{ network_connection_name }}'
+      ipv4_addresses: 127.0.0.1
+
+  - name: ensure domain exists and DC is promoted as a domain controller
+    win_domain:
+      dns_domain_name: '{{ domain_name }}'
+      safe_mode_password: '{{ domain_password }}'
+    register: domain_setup_res
+
+  - name: reboot DC if required after install
+    win_reboot:
+    when: domain_setup_res.reboot_required
+
+  - name: create domain username
+    win_domain_user:
+      name: '{{ domain_username }}'
+      upn: '{{ domain_upn }}'
+      description: '{{ domain_username }} Domain Account'
+      password: '{{ domain_password }}'
+      password_never_expires: yes
+      update_password: on_create
+      groups:
+      - Domain Admins
+      state: present
+
+  - name: test out domain user that was created
+    win_whoami:
+    register: become_res
+    failed_when: become_res is failed or become_res.upn != domain_upn
+    become: yes
+    become_method: runas
+    vars:
+      ansible_become_user: '{{ domain_upn }}'
+      ansible_become_pass: '{{ domain_password }}'
+
+  - name: create GPO for Kerberos FAST and Claims policies
+    win_gpo:
+      name: Kerberos-FAST
+      state: present
+      comment: For testing FAST/claims support
+    register: gpo_create
+
+  - name: configure KDC support for FAST and Claims in GPO
+    win_gpo_reg:
+      gpo: Kerberos-FAST
+      path: HKLM\Software\Microsoft\Windows\CurrentVersion\Policies\System\KDC\Parameters
+      name: EnableCbacAndArmor
+      type: DWord
+      value: 1
+    register: gpo_val_kdc_enable
+
+  - name: configure Kerberos clients to use armorning in GPO
+    win_gpo_reg:
+      gpo: Kerberos-FAST
+      path: HKLM\Software\Microsoft\Windows\CurrentVersion\Policies\System\Kerberos\Parameters
+      name: EnableCbacAndArmor
+      type: DWord
+      value: 1
+    register: gpo_val_kerb_enable
+
+  - name: link GPO to all objects in the domain
+    win_gpo_link:
+      name: Kerberos-FAST
+      enabled: True
+      enforced: True
+      state: present
+    register: gpo_link
+
+  - name: reboot if GPO settings have changed
+    win_reboot:
+    when: >-
+      gpo_create is changed or
+      gpo_val_kdc_enable is changed or
+      gpo_val_kerb_enable is changed or
+      gpo_link is changed
+
+- name: join Windows host to domain
+  hosts: win_children
+  gather_facts: no
+  tasks:
+  - name: set the DNS for the private adapter to point to the DC
+    win_dns_client:
+      adapter_names: '{{ network_connection_name }}'
+      ipv4_addresses: '{{ hostvars[groups["win_controller"][0]]["ansible_host"] }}'
+
+  - name: join host to domain
+    win_domain_membership:
+      dns_domain_name: '{{ domain_name }}'
+      domain_admin_user: '{{ domain_upn }}'
+      domain_admin_password: '{{ domain_password }}'
+      state: domain
+    register: domain_join_result
+
+  - name: reboot host to finalise domain join
+    win_reboot:
+    when: domain_join_result.reboot_required
+
+  - name: test out domain user logon
+    win_whoami:
+    register: become_res
+    failed_when: become_res is failed or become_res.upn != domain_upn
+    become: yes
+    become_method: runas
+    vars:
+      ansible_become_user: '{{ domain_upn }}'
+      ansible_become_pass: '{{ domain_password }}'
+
+- name: set up Linux host
+  hosts: linux_children
+  gather_facts: no
+  become: yes
+  handlers:
+  - name: restart NetworkManager.service
+    service:
+      name: NetworkManager.service
+      state: restarted
+
+  tasks:
+  - name: install base packages
+    yum:
+      name:
+      - dnsmasq
+      - gcc
+      - krb5-devel
+      - krb5-workstation
+      - python38
+      - python38-devel
+      - vim
+      state: present
+
+  - name: setup NetworkManager to use dnsmasq
+    copy:
+      dest: /etc/NetworkManager/conf.d/dns.conf
+      content: |
+        [main]
+        dns=dnsmasq
+    notify: restart NetworkManager.service
+
+  - name: set dnsmasq to forward requests for domain to DC
+    copy:
+      dest: /etc/NetworkManager/dnsmasq.d/{{ domain_name }}
+      content: server=/{{ domain_name }}/{{ hostvars[groups['win_controller'][0]]["ansible_host"] }}
+    notify: restart NetworkManager.service
+
+  - name: template krb5.conf file
+    template:
+      src: krb5.conf.tmpl
+      dest: /etc/krb5.conf
+
+  - name: create AD computer account for Linux client armoring
+    win_domain_computer:
+      name: LINUX
+      sam_account_name: LINUX$
+      dns_hostname: linux.{{ domain_name }}
+      description: Kerberos principal for Linux client armoring keytab
+      ou: CN=Computers,DC={{ domain_name.split('.') | join(',DC=') }}
+      enabled: True
+      state: present
+    delegate_to: DC01
+    become: False
+
+  - name: create keytab for Linux client armoring
+    win_shell: >-
+      ktpass.exe
+      -out C:\temp\linux.keytab
+      -princ host/linux.{{ domain_name }}@{{ domain_name | upper }}
+      -mapUser LINUX$@{{ domain_name | upper }}
+      +rndpass
+      -mapOp set
+      -crypto AES256-SHA1
+      -ptype KRB5_NT_SRV_HST
+      +answer
+      &&
+      ktpass.exe
+      -in C:\temp\linux.keytab
+      -out C:\temp\linux.keytab
+      -princ host/linux.{{ domain_name }}@{{ domain_name | upper }}
+      -mapUser LINUX$@{{ domain_name | upper }}
+      +rndpass
+      -mapOp set
+      -crypto AES128-SHA1
+      -ptype KRB5_NT_SRV_HST
+      +answer
+    args:
+      creates: C:\temp\linux.keytab
+      executable: cmd.exe
+    delegate_to: DC01
+    become: False
+
+  - name: fetch the keytab
+    fetch:
+      src: C:\temp\linux.keytab
+      dest: linux.keytab
+      flat: yes
+    delegate_to: DC01
+    become: False
+
+  - name: copy keytabs to host
+    copy:
+      src: linux.keytab
+      dest: /etc/linux.keytab
+
+- name: configure FAST enforcement policies
+  hosts: win_controller
+  gather_facts: no
+  tasks:
+  - name: configure KDC to enforce armored requested in GPO
+    win_gpo_reg:
+      gpo: Kerberos-FAST
+      path: HKLM\Software\Microsoft\Windows\CurrentVersion\Policies\System\KDC\Parameters
+      name: CbacAndArmorLevel
+      type: DWord
+      value: 3  # Fail unarmored authentication requests
+    register: gpo_enforce_fast
+
+  - name: configure Kerberos clients to enforce armorning in GPO
+    win_gpo_reg:
+      gpo: Kerberos-FAST
+      path: HKLM\Software\Microsoft\Windows\CurrentVersion\Policies\System\Kerberos\Parameters
+      name: RequireFast
+      type: DWord
+      value: 1
+
+  - name: reboot KDC if policy changed
+    win_reboot:
+    when: gpo_enforce_fast is changed

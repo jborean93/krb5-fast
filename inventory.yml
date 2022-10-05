@@ -1,0 +1,36 @@
+all:
+  children:
+    windows:
+      children:
+        win_controller:
+          hosts:
+            DC01:
+              ansible_host: 192.168.66.10
+              vagrant_box: jborean93/WindowsServer2022
+        win_children:
+          hosts:
+            WIN:
+              ansible_host: 192.168.66.11
+              vagrant_box: jborean93/WindowsServer2022
+      vars:
+        ansible_connection: psrp
+        ansible_port: 5985
+
+    linux:
+      children:
+        linux_children:
+          hosts:
+            LINUX:
+              ansible_host: 192.168.66.12
+              vagrant_box: centos/stream8
+      vars:
+        ansible_ssh_common_args: -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no
+
+  vars:
+    ansible_user: vagrant
+    ansible_password: vagrant
+
+    domain_name: fast.test
+    domain_username: fast
+    domain_password: Password01
+    domain_upn: '{{ domain_username }}@{{ domain_name | upper }}'
